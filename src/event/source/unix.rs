@@ -107,6 +107,23 @@ impl EventSource for UnixInternalEventSource {
                                             &self.tty_buffer[..read_count],
                                             read_count == TTY_BUFFER_SIZE,
                                         );
+
+                                        if read_count == TTY_BUFFER_SIZE {
+                                            // NB: the tty fd is in blocking mode
+                                            //
+                                            // The Error io::ErrorKind::WouldBlock
+                                            // will never append and we will be stucked in self.tty_fd.read
+                                            //
+                                            // Because We do not know the number of pending bytes,
+                                            // We must restart triggering of input events
+                                            self.poll.registry().reregister(
+                                                &mut SourceFd(&self.tty_fd.raw_fd()),
+                                                TTY_TOKEN,
+                                                Interest::READABLE,
+                                            )?;
+
+                                            break;
+                                        }
                                     }
                                 }
                                 Err(ErrorKind::IoError(e)) => {
