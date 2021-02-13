@@ -3,6 +3,8 @@ use std::{collections::VecDeque, io, time::Duration};
 use mio::{unix::SourceFd, Events, Interest, Poll, Token};
 use signal_hook::iterator::Signals;
 
+use libc::{fcntl, F_GETFL, F_SETFL, O_NONBLOCK};
+
 use crate::{ErrorKind, Result};
 
 #[cfg(feature = "event-stream")]
@@ -71,6 +73,24 @@ impl UnixInternalEventSource {
     }
 }
 
+fn set_non_blocking_fd(fd: i32) -> bool {
+    unsafe {
+        match fcntl(fd, F_GETFL, 0) {
+            -1 => false,
+            flg => fcntl(fd, F_SETFL, flg | O_NONBLOCK) == 0,
+        }
+    }
+}
+
+fn set_blocking_fd(fd: i32) -> bool {
+    unsafe {
+        match fcntl(fd, F_GETFL, 0) {
+            -1 => false,
+            flg => fcntl(fd, F_SETFL, flg & !O_NONBLOCK, 0) != -1,
+        }
+    }
+}
+
 impl EventSource for UnixInternalEventSource {
     fn try_read(&mut self, timeout: Option<Duration>) -> Result<Option<InternalEvent>> {
         if let Some(event) = self.parser.next() {
@@ -107,11 +127,40 @@ impl EventSource for UnixInternalEventSource {
                                             &self.tty_buffer[..read_count],
                                             read_count == TTY_BUFFER_SIZE,
                                         );
+
+                                        if read_count == TTY_BUFFER_SIZE {
+                                            // BUG WORK ARROUND:
+                                            // When reading exactly TTY_BUFFER_SIZE bytes
+                                            //
+                                            // mio uses epoll in edge-triggred mode (verions >= 0.6)
+                                            // but the TTY input fd is non in non-blocking mode
+                                            // when toggling the O_NONBLOCK
+                                            // if we set the 0 fd in non-blocking mode
+                                            // println!("") functon family will panic
+                                            // some thing like "not available"
+                                            set_non_blocking_fd(0);
+
+                                            // NB: the tty fd is in blocking mode
+                                            //
+                                            // The Error io::ErrorKind::WouldBlock
+                                            // will never append and we will be stucked in self.tty_fd.read
+                                            //
+                                            // Because We do not know the number of pending bytes,
+                                            // We must restart triggering of input events
+                                            self.poll.registry().reregister(
+                                                &mut SourceFd(&self.tty_fd.raw_fd()),
+                                                TTY_TOKEN,
+                                                Interest::READABLE,
+                                            )?;
+
+                                            break;
+                                        }
                                     }
                                 }
                                 Err(ErrorKind::IoError(e)) => {
                                     // No more data to read at the moment. We will receive another event
                                     if e.kind() == io::ErrorKind::WouldBlock {
+                                        set_blocking_fd(0);
                                         break;
                                     }
                                     // once more data is available to read.
@@ -126,7 +175,10 @@ impl EventSource for UnixInternalEventSource {
                                 return Ok(Some(event));
                             }
                         }
+
+                        set_blocking_fd(0);
                     }
+
                     SIGNAL_TOKEN => {
                         for signal in &self.signals {
                             match signal as libc::c_int {
